@@ -1,0 +1,170 @@
+#cholangiocarcinoma dataset 3.1
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(rhdf5)
+library(SingleCellExperiment)
+library(Seurat)
+library(data.table)
+
+library(dplyr)
+library(dbplyr)
+library(tidyr)
+library(tibble)
+library(readr)
+library(ggplot2)
+library(magrittr)
+library(readxl)
+library(stringr)
+library(testit)
+library(knitr)
+library(ggpubr)
+library(Matrix.utils)
+library(S4Vectors)
+library(Biobase)
+library(immunedeconv)
+library(data.tree)
+library(rsample)
+
+```
+
+loading data
+```{r}
+
+counts <- Read10X_h5("loading_data/single_cell_data/CHOL_GSE125449_aPD1aPDL1aCTLA4_expression.h5")
+
+## metadata
+l <- read_tsv("loading_data/single_cell_data/CHOL_GSE125449_aPD1aPDL1aCTLA4_CellMetainfo_table.tsv")
+
+
+malignancy = unique(l$`Celltype (malignancy)`)
+Patient = unique(l$Patient)
+Major = unique(l$`Celltype (major-lineage)`)
+
+l <- read_tsv("loading_data/single_cell_data/CHOL_GSE125449_aPD1aPDL1aCTLA4_CellMetainfo_table.tsv",
+  col_types = list(
+  `Celltype (malignancy)` = col_factor(malignancy),
+  `Celltype (major-lineage)` = col_factor(Major),
+  Patient = col_factor(Patient)))
+
+l <- l%>%
+  rename( Malignancy = `Celltype (malignancy)`,
+          cell_type = `Celltype (major-lineage)`, #make_bulk_eset heeft kolom cell_type nodig
+          Minor = `Celltype (minor-lineage)`)
+
+```
+
+#creating expressionset class -> immunedeconve package
+```{r}
+sce <- SingleCellExperiment(assays = list(counts = counts),
+                            colData = l)
+
+p <- colData(sce)[,"Cell"]
+finaldata <- as.matrix(t(aggregate.Matrix(t(counts(sce)), groupings = p, fun = "sum")))
+
+
+l2 <- l%>%
+  arrange(Cell)%>%
+  column_to_rownames("Cell")
+
+pheno <- new("AnnotatedDataFrame", data=l2)
+
+exp =  ExpressionSet(finaldata, pheno)
+
+
+```
+
+#creating list of all cell types
+```{r echo=FALSE}
+cell_types = list(
+  available=pData(exp)%>%
+  select(cell_type) %>% distinct() %>% pull(cell_type),
+  cancer=c("Malignant"),
+  other = c("Endothelial","Fibroblasts")
+)
+cell_types$immune_cells = as.character(cell_types$available[!cell_types$available %in% c(cell_types$cancer, cell_types$other)])
+
+cell_types$background_cells = c(cell_types$cancer, cell_types$other)
+cell_types$n_background_cells = exp %>% pData() %>%
+  filter(cell_type %in% cell_types$background_cells) %>%
+  group_by(cell_type) %>%
+  count() %>%
+  {'names<-'(.$n, .$cell_type)}
+```
+
+
+
+creating pseudobulk samples
+
+Average fraction of tumour cells
+
+```{r tumor-ct-fractions, results='hide', echo=FALSE, fig.cap="proportion of cell types by tumor sample"}
+cell_type_table = pData(exp) %>%
+  filter(Source %in% "Tumor")%>%
+  mutate(Sample=paste(Source, Patient, sep="_")) %>%
+  group_by(Source, Sample, cell_type) %>%
+  summarise(n=n()) %>%
+  mutate(freq=n/sum(n))
+
+ggplot(cell_type_table, aes(x=Sample, y=freq)) +
+  geom_bar(aes(fill=cell_type), stat="identity")
+  
+  
+```
+
+```{r, echo=FALSE}
+cancer_cells = cell_type_table %>%
+  filter(cell_type %in% cell_types$cancer)
+```
+
+```{r}
+cancer_cell_param = MASS::fitdistr(cancer_cells$freq, "normal")
+```
+
+```{r mixing_make_proportions, echo=FALSE}
+
+set.seed(999)
+is_melanoma = rep(TRUE, 100)
+
+cell_fractions = lapply(is_melanoma, function(melanoma) {
+  cancer_fraction = rnorm(1, mean=cancer_cell_param$estimate[1], sd=cancer_cell_param$estimate[2])
+  cancer_fraction = ifelse(cancer_fraction < 0, 0, cancer_fraction)
+  cancer_fraction = ifelse(cancer_fraction >= .99, .99, cancer_fraction)
+  names(cancer_fraction) = cell_types$cancer
+
+  
+  # compute random fractions for other cells
+  use_cell_types = c(cell_types$immune_cells, cell_types$other)
+  remaining_fraction = 1 - cancer_fraction
+  rnd = sample(0:100, length(use_cell_types), TRUE)
+  tmp_fractions = (remaining_fraction * rnd) / sum(rnd)
+  names(tmp_fractions) = use_cell_types
+
+  c(cancer_fraction, tmp_fractions)
+}) %>% bind_rows()
+
+# assert almost equal
+assert("all fractions sum up to 1", all(apply(cell_fractions, 1, sum) - rep(1, 100) < 1e-4))
+
+
+```
+
+
+
+```{r}
+set.seed(999)
+bulk_liver_3.1 = make_bulk_eset(eset=exp,
+                           cell_fractions = cell_fractions,
+                           n=500)
+fData(bulk_liver_3.1) = rownames_to_column(fData(bulk_liver_3.1),var = "gene_symbol")
+
+saveRDS(bulk_liver_3.1,"loading_data/pseudobulk_data/bulk_liver_3.1.rds")
+
+
+bulk_liver_3.1_txt = as.data.frame(exprs(bulk_liver_3.1))%>%
+ rownames_to_column("Gene")
+
+
+write.table(bulk_liver_3.1_txt, sep = '\t', "bulk_liver_3.1.txt", row.names = FALSE, quote = FALSE, col.names = TRUE)
+
+```
