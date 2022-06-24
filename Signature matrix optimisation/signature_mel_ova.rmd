@@ -1,0 +1,410 @@
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(rhdf5)
+library(SingleCellExperiment)
+library(Seurat)
+library(data.table)
+
+library(dplyr)
+library(dbplyr)
+library(tidyr)
+library(tibble)
+library(readr)
+library(ggplot2)
+library(magrittr)
+library(readxl)
+library(stringr)
+library(testit)
+library(knitr)
+library(ggpubr)
+library(Matrix.utils)
+library(S4Vectors)
+library(Biobase)
+library(immunedeconv)
+library(data.tree)
+library(rsample)
+
+```
+
+#loading data
+
+```{r}
+load("~/Lieselore/R/immune_deconvolution_benchmark/data/schelker/single_cell_schelker.rda")
+  valid_cells = pData(single_cell_schelker)$cell_type != "Unknown"
+  eset = single_cell_schelker[, valid_cells]
+  exprs(eset) = 2^exprs(eset)-1
+  pData(eset) = rownames_to_column(pData(eset), "Cell")
+  pData(eset) %<>% rename(method_cell_type=cell_type) %>%
+    inner_join(immunedeconv::cell_type_map %>% filter(method_dataset == "schelker_single_cell"))
+  pbmc_cells = pData(eset)$source != "pbmc"
+  eset = eset[,pbmc_cells]  
+  assert("no unknown cells left", !any(pData(eset)$cell_type == "Unknown"))
+
+  signature_mel_ova = eset
+  
+  l <- pData(signature_mel_ova)
+  
+  counts <- exprs(signature_mel_ova)
+  
+subset_l <- l%>%
+  group_by("cell_type")%>%
+  sample_frac(0.70)
+
+cells_subset <- subset_l$Cell
+
+subset_counts <- select(as.data.frame(counts),all_of(cells_subset))
+ 
+rm(single_cell_schelker,counts,l,eset)
+```
+
+#splitting dataset in two: 80% training, 20% validation
+```{r}
+set.seed(999)
+split <- initial_split(subset_l,prop = 0.8, strata = cell_type)
+
+training_l <- training(split)
+testing_l <- testing(split)
+
+cells_training <- training_l$Cell
+cells_testing <- testing_l$Cell
+
+training_counts <- select(as.data.frame(subset_counts), all_of(cells_training))
+testing_counts <- select(as.data.frame(subset_counts), all_of(cells_testing))
+
+
+```
+
+
+#creating expressionset class -> immunedeconve package
+```{r}
+training_sce <- SingleCellExperiment(assays = list(counts = training_counts),
+                            colData = training_l)
+
+training_p <- colData(training_sce)[,"Cell"]
+training_finaldata <- as.matrix(t(aggregate.Matrix(t(counts(training_sce)), groupings = training_p, fun = "sum")))
+
+
+training_l2 <- training_l%>%
+  arrange(Cell)%>%
+  column_to_rownames("Cell")
+
+training_pheno <- new("AnnotatedDataFrame", data=training_l2)
+
+training_exp =  ExpressionSet(training_finaldata, training_pheno)
+
+
+```
+
+#herhalen voor testing
+
+```{r}
+testing_sce <- SingleCellExperiment(assays = list(counts = testing_counts),
+                            colData = testing_l)
+
+testing_p <- colData(testing_sce)[,"Cell"]
+testing_finaldata <- as.matrix(t(aggregate.Matrix(t(counts(testing_sce)), groupings = testing_p, fun = "sum")))
+
+
+testing_l2 <- testing_l%>%
+  arrange(Cell)%>%
+  column_to_rownames("Cell")
+
+testing_pheno <- new("AnnotatedDataFrame", data=testing_l2)
+
+testing_exp =  ExpressionSet(testing_finaldata, testing_pheno)
+
+rm(testing_sce)
+```
+
+#creating list of all cell types
+
+```{r echo=FALSE}
+cell_types = list(
+  available=pData(training_exp) %>% select(cell_type) %>% distinct() %>% pull(cell_type),
+  cancer=c("Melanoma cell", "Ovarian carcinoma cell"),
+  other=c("Cancer associated fibroblast", "Endothelial cell")
+)
+cell_types$immune_cells = cell_types$available[!cell_types$available %in% c(cell_types$cancer, cell_types$other)]
+
+cell_types$background_cells = c(cell_types$cancer, cell_types$other)
+cell_types$n_background_cells = training_exp %>% pData() %>%
+  filter(cell_type %in% cell_types$background_cells) %>%
+  group_by(cell_type) %>%
+  count() %>%
+  {'names<-'(.$n, .$cell_type)}
+```
+
+## creating pseudobulk samples with TESTING data set
+# Average fraction of tumour cells
+To obtain representatitive simulated samples, we are interested in the average fraction of tumour cells vs immune cells in a mixture.
+
+```{r tumor-ct-fractions, results='hide', echo=FALSE, fig.cap="proportion of cell types by tumor sample"}
+cell_type_table = pData(testing_exp) %>%
+  filter(source %in% c("melanoma", "ascites")) %>%
+  mutate(sample=paste(source, donor, sep="_")) %>%
+  group_by(source, sample, cell_type) %>%
+  summarise(n=n()) %>%
+  mutate(freq=n/sum(n))
+
+ggplot(cell_type_table, aes(x=sample, y=freq)) +
+  geom_bar(aes(fill=cell_type), stat="identity")
+  
+  
+``` 
+```{r, echo=FALSE}
+cancer_cells = cell_type_table %>%
+  filter(cell_type %in% cell_types$cancer)
+```
+
+```{r}
+cancer_cell_param = MASS::fitdistr(cancer_cells$freq, "normal")
+```
+
+
+The fractions of a sample are randomly assigned in the following procedure:
+
+1. Draw a random tumour cell content from the distribution fitted above
+2. The first half of the samples will use melanoma cells, the second half ovarian cancer cells.
+3. Assign the remaining fraction (=not cancer cells) randomly to the remaining cell types (B cell, T cell CD8+, Melanoma cell, T cell CD4+ (non-regulatory), Macrophage/Monocyte, T cell regulatory (Tregs), Cancer associated fibroblast, Dendritic cell, Endothelial cell, NK cell, PBMC, Ovarian carcinoma cell)
+```{r mixing_make_proportions, echo=FALSE}
+set.seed(999)
+
+is_melanoma = c(rep(TRUE, 50), rep(FALSE, 50))
+
+cell_fractions = lapply(is_melanoma, function(melanoma) {
+  cancer_fraction = rnorm(1, mean=cancer_cell_param$estimate[1], sd=cancer_cell_param$estimate[2])
+  cancer_fraction = ifelse(cancer_fraction < 0, 0, cancer_fraction)
+  cancer_fraction = ifelse(cancer_fraction >= .99, .99, cancer_fraction)
+
+  # associate fraction randomly ot Melanoma or Ovarian
+  if(melanoma) {
+    cancer_fractions = list(cancer_fraction, 0)
+  } else {
+    cancer_fractions = list(0, cancer_fraction)
+  }
+  names(cancer_fractions) = cell_types$cancer
+
+  # compute random fractions for other cells
+  use_cell_types = c(cell_types$immune_cells, cell_types$other)
+  remaining_fraction = 1 - cancer_fraction
+  rnd = sample(0:100, length(use_cell_types), TRUE)
+  tmp_fractions = (remaining_fraction * rnd) / sum(rnd)
+  names(tmp_fractions) = use_cell_types
+
+  c(cancer_fractions, tmp_fractions)
+}) %>% bind_rows()
+
+# assert almost equal
+assert("all fractions sum up to 1", all(apply(cell_fractions, 1, sum) - rep(1, 100) < 1e-4))
+```
+
+```{r}
+set.seed(999)
+bulk_eset_mel_ova = make_bulk_eset(eset=testing_exp,
+                           cell_fractions = cell_fractions,
+                           n=500)
+
+fData(bulk_eset_mel_ova) = rownames_to_column(fData(bulk_eset_mel_ova),var = "gene_symbol")
+#saveRDS(bulk_eset_mel_ova, "bulk_eset_mel_ova.rda")
+
+bulk_mel_ova = as.data.frame(exprs(bulk_eset_mel_ova))%>%
+  rownames_to_column("Gene")
+
+
+
+#write.table(bulk_mel_ova, sep = '\t', "bulk_mel_ova.txt", row.names = FALSE, quote = FALSE, col.names = TRUE)
+
+```
+
+
+#true fractions van simulated samples
+```{r}
+bulk_eset_mel_ova = read_rds("loading_data/pseudobulk_data/bulk_eset_mel_ova.rda")
+fData(bulk_eset_mel_ova) = rownames_to_column(fData(bulk_eset_mel_ova),var = "gene_symbol")
+true_mel_ova = pData(bulk_eset_mel_ova)%>%
+  t() %>%
+  as_tibble(rownames="cell_type")%>%
+  gather(sample, true_fraction, -cell_type)
+
+
+
+ggplot(true_mel_ova, aes(x=sample, y=true_fraction)) +
+  geom_bar(aes(fill=cell_type), stat="identity") +
+  theme(axis.text.x=element_text(angle = 90, vjust = 0.5, hjust=1)) 
+```
+
+# Making single cell reference matrix with TRAINING
+
+```{r}
+
+a <- t(counts(training_sce))
+
+b <- data.frame(colData(training_sce)[,c("Cell","cell_type")],row.names = NULL)%>%
+  mutate(Cell_type = as.character(cell_type))%>%
+  select(-cell_type)%>%
+  column_to_rownames("Cell")
+
+data <- cbind(a,b)
+
+data2 <- rownames_to_column(data, "Cell")%>%
+  select(-Cell)%>%
+  select(Cell_type, everything())
+  
+
+sigmatrix <- as.data.frame(t(data2))
+#saveRDS(sigmatrix, "transposed.rds")
+
+finalsigmatrix <- sigmatrix%>%
+  unname()
+
+row.names(finalsigmatrix)[1] <- " "
+
+write.table(finalsigmatrix, sep = '\t', "sigmatrix_mel_ova.txt", row.names = TRUE, quote = FALSE)
+```
+
+
+#Cibersortx results
+
+```{r}
+devtools::load_all("~/Lieselore/R/Benchmark/immunedeconv")
+
+res_mel_ova = read.delim("~/Lieselore/R/Signature matrix/cibersort_results/CIBERSORTx_mel_ova.txt")%>%
+  select(-P.value,-Correlation,-RMSE,-Absolute.score..sig.score.)%>%
+  column_to_rownames("Mixture")
+
+cell_types_mel_ova = c("Macrophage/Monocyte" ,"Ovarian carcinoma cell","Cancer associated fibroblast","B cell","T cell regulatory (Tregs)","Dendritic cell",
+                       "Endothelial cell","NK cell" ,"Melanoma cell" ,"T cell CD4+ (non-regulatory)","T cell CD8+")
+colnames(res_mel_ova) = cell_types_mel_ova
+
+res_mel_ova= res_mel_ova%>%
+  t()%>%
+  as.data.frame()%>%
+  rownames_to_column("cell_type")
+
+
+
+show_cell_types = c("B cell", "T cell CD4+", "T cell CD8+", "NK cell", "Macrophage/Monocyte", "Dendritic cell","T cell CD4+ (non-regulatory)"
+                    ,"T cell regulatory (Tregs)")
+
+
+res_mel_ova2 = map_result_to_celltypes(res_mel_ova, show_cell_types)%>%
+  rownames_to_column("cell_type")%>%
+  gather(sample,fraction,-cell_type)%>%
+  mutate(method = "Melanoma and ovarian 5.1 signature matrix")
+  
+                                                                                                                                                                                                                                      
+both_mel_ova = inner_join(res_mel_ova2,true_mel_ova,by=c("sample","cell_type"))
+                                                                                                                                                                                                                                
+
+ggplot(both_mel_ova, aes(x=true_fraction, y=fraction)) +
+  labs(title = "Cibersortx")+
+  facet_grid(~cell_type, scales="free") +
+  geom_point() +
+  stat_smooth(method="lm") +
+  stat_cor()
+```
+#compare to original cibersort from immunedeconve package
+```{r}
+
+set_cibersort_binary("~/Lieselore/R/Benchmark/lib/CIBERSORT/CIBERSORT.R")
+set_cibersort_mat("~/Lieselore/R/Benchmark/lib/CIBERSORT/LM22.txt")
+res_mel_ova_orig =  deconvolute(bulk_eset_mel_ova,"cibersort_abs", tumor = TRUE, scale_mrna = FALSE,
+                                column = "gene_symbol") 
+                  
+
+
+
+  
+res_mel_ova_orig2 = map_result_to_celltypes(res_mel_ova_orig, show_cell_types)%>%
+  rownames_to_column("cell_type")%>%
+  gather(sample,fraction,-cell_type)%>%
+  mutate(method = "LM22")
+
+both_mel_ova_orig = inner_join(res_mel_ova_orig2,true_mel_ova,by=c("sample","cell_type"))
+
+ggplot(both_mel_ova_orig, aes(x=true_fraction, y=fraction)) +
+  labs(title = "Cibersort")+
+  facet_grid(~cell_type, scales="free") +
+  geom_point() +
+  stat_smooth(method="lm") +
+  stat_cor()
+```
+#creating plot with cibersort and cibersortx results
+```{r}
+all_results_cibersort_mel_ova= bind_rows(res_mel_ova2,res_mel_ova_orig2)%>%
+  arrange(method, cell_type, sample)
+
+results_with_true_mel_ova = inner_join(all_results_cibersort_mel_ova,true_mel_ova,by=c("sample","cell_type"))
+
+results_with_true_mel_ova %>%
+  ggplot(aes(x=true_fraction, y=fraction)) +
+  facet_grid(method ~ cell_type, scales="free") +
+  geom_point() +
+  stat_smooth(aes(color=method), method="lm") +
+  scale_x_continuous(breaks=c(.2, .3)) +
+  stat_cor(aes(label = ..r.label..),size = 3,label.y.npc="top", label.x.npc = "left")+
+  scale_color_discrete(name = "Signature matrix")+
+  xlab("True fraction")+
+  ggtitle("Melanoma and ovarian 5.1")+
+  ylab("Fraction")-> p3
+
+ggsave("plot_melova_both_cibersort.png", width = 20, height = 10)
+```
+
+
+
+#using melanoma signature to deconvolute mel_ova bulk
+```{r}
+res_mel_ova_melREF = read.delim("~/Lieselore/R/Signature matrix/cibersort_results/CIBERSORTx_melova_melREF.txt")%>%
+  select(-P.value,-Correlation,-RMSE,-Absolute.score..sig.score.)%>%
+  column_to_rownames("Mixture")%>%
+  rename("B cell" = B,
+         "T cell CD4+" = CD4Tconv,
+         "T cell CD8+" = CD8Tex,
+         "Macrophage/Monocyte" = "Mono.Macro",
+         "Endothelial cell" = Endothelial,
+         "cancer cell" = Malignant)%>%
+  t()%>%
+  as.data.frame()%>%
+  rownames_to_column("cell_type")
+
+
+
+show_cell_types = c("B cell", "T cell CD4+", "T cell CD8+", "cancer cell", "Macrophage/Monocyte")
+
+#res_lung2 = map_result_to_celltypes(res_lung, show_cell_types, method = "random")
+
+res_mel_ova_melREF2 = map_result_to_celltypes(res_mel_ova_melREF, show_cell_types)%>%
+  rownames_to_column("cell_type")%>%
+  gather(sample,fraction,-cell_type)
+
+true_mel_ova_wider = pData(bulk_eset_mel_ova)%>%
+  t()%>%
+  as.data.frame()%>%
+  rownames_to_column("cell_type")
+
+
+true_mel_ova_melREF =  map_result_to_celltypes(true_mel_ova_wider, cell_types_epic)%>%
+  rownames_to_column("cell_type")%>%
+  gather(sample,true_fraction,-cell_type)                                                                                                                                                                                                                                   
+both_mel_ova_melREF = inner_join(res_mel_ova_melREF2,true_mel_ova_melREF,by=c("sample","cell_type"))
+                                                                                                                                                                                                                                
+
+ggplot(both_mel_ova_melREF, aes(x=true_fraction, y=fraction)) +
+  labs(title = "Cibersortx")+
+  facet_grid(~cell_type, scales="free") +
+  geom_point() +
+  stat_smooth(method="lm") +
+  stat_cor()
+```
+
+```{r}
+library(patchwork)
+
+p1 / p2 / p3 +
+  plot_annotation(tag_levels = 'a')
+
+ggsave("plot_validation cibersortx.png", width = 16, height = 20)
+```
+

@@ -1,0 +1,237 @@
+#melanoma 1.1 minor signature matrix
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(rhdf5)
+library(SingleCellExperiment)
+library(Seurat)
+library(data.table)
+
+library(dplyr)
+library(dbplyr)
+library(tidyr)
+library(tibble)
+library(readr)
+library(ggplot2)
+library(magrittr)
+library(readxl)
+library(stringr)
+library(testit)
+library(knitr)
+library(ggpubr)
+library(Matrix.utils)
+library(S4Vectors)
+library(Biobase)
+library(immunedeconv)
+library(data.tree)
+library(rsample)
+
+```
+
+#Melanoma 1.1 
+-> simulated samples + signature matrix: splitting into testing and validation
+
+
+```{r,loading data}
+
+counts <- Read10X_h5("loading_data/single_cell_data/SKCM_GSE72056_expression.h5")
+
+# metadata
+l <- read_tsv("loading_data/single_cell_data/SKCM_GSE72056_CellMetainfo_table.tsv", 
+  col_types = list(
+  `Celltype (malignancy)` = col_factor(c("Immune cells", "Malignant cells", "Stromal cells")),
+  `Celltype (major-lineage)` = col_factor(c("B", "CD4Tconv", "CD8Tex","Endothelial", "Fibroblasts","Malignant" ,"Mono/Macro", "Tprolif")),
+  `Celltype (minor-lineage)` = col_factor(c("B","CD4Tn", "CD8Tex","Endothelial","Fibroblasts", "Tfh", "Th1","Malignant", "Monocyte", "Tprolif"))))
+
+l <- l%>%
+  rename( Malignancy = `Celltype (malignancy)`,
+          Major = `Celltype (major-lineage)`, #make_bulk_eset heeft kolom cell_type nodig
+          cell_type = `Celltype (minor-lineage)`)
+
+
+```
+
+splitting dataset in two: 80% training, 20% validation
+```{r}
+set.seed(999)
+split <- initial_split(l,prop = 0.8, strata = cell_type)
+
+training_l <- training(split)
+testing_l <- testing(split)
+
+cells_training <- training_l$Cell
+cells_testing <- testing_l$Cell
+
+training_counts <- select(as.data.frame(counts), all_of(cells_training))
+testing_counts <- select(as.data.frame(counts), all_of(cells_testing))
+```
+
+creating expressionset class -> immunedeconve package
+```{r}
+training_sce <- SingleCellExperiment(assays = list(counts = training_counts),
+                            colData = training_l)
+
+training_p <- colData(training_sce)[,"Cell"]
+training_finaldata <- as.matrix(t(aggregate.Matrix(t(counts(training_sce)), groupings = training_p, fun = "sum")))
+
+
+training_l2 <- training_l%>%
+  arrange(Cell)%>%
+  column_to_rownames("Cell")
+
+training_pheno <- new("AnnotatedDataFrame", data=training_l2)
+
+training_exp =  ExpressionSet(training_finaldata, training_pheno)
+
+```
+
+herhalen voor testing
+```{r}
+testing_sce <- SingleCellExperiment(assays = list(counts = testing_counts),
+                            colData = testing_l)
+
+testing_p <- colData(testing_sce)[,"Cell"]
+testing_finaldata <- as.matrix(t(aggregate.Matrix(t(counts(testing_sce)), groupings = testing_p, fun = "sum")))
+
+
+testing_l2 <- testing_l%>%
+  arrange(Cell)%>%
+  column_to_rownames("Cell")
+
+testing_pheno <- new("AnnotatedDataFrame", data=testing_l2)
+
+testing_exp =  ExpressionSet(testing_finaldata, testing_pheno)
+```
+
+creating list of all cell types
+```{r echo=FALSE}
+cell_types = list(
+  available=pData(training_exp) %>% select(cell_type) %>% distinct() %>% pull(cell_type),
+  major=pData(training_exp) %>% select(Major) %>% distinct() %>% pull(Major),
+  cancer=c("Malignant"),
+  other=c("Endothelial","Fibroblasts")
+)
+cell_types$immune_cells = as.character(cell_types$available[!cell_types$available %in% c(cell_types$cancer, cell_types$other)])
+
+cell_types$background_cells = c(cell_types$cancer, cell_types$other)
+cell_types$n_background_cells = training_exp %>% pData() %>%
+  filter(cell_type %in% cell_types$background_cells) %>%
+  group_by(cell_type) %>%
+  count() %>%
+  {'names<-'(.$n, .$cell_type)}
+```
+
+creating pseudobulk samples with TESTING data set
+
+Average fraction of tumour cells
+```{r tumor-ct-fractions, results='hide', echo=FALSE, fig.cap="proportion of cell types by tumor sample"}
+cell_type_table = pData(testing_exp) %>%
+  filter(Source %in% "Tumor") %>% #alleen tumor samples selecteren 
+  mutate(Sample=paste(Source, Patient, sep="_")) %>%
+  group_by(Source, Sample, cell_type) %>%
+  summarise(n=n()) %>%
+  mutate(freq=n/sum(n))
+
+ggplot(cell_type_table, aes(x=Sample, y=freq)) +
+  geom_bar(aes(fill=cell_type), stat="identity")
+  
+pData(testing_exp) %>%
+  group_by(cell_type) %>%
+  count()   
+```
+
+```{r, echo=FALSE}
+cancer_cells = cell_type_table %>%
+  filter(cell_type %in% cell_types$cancer)
+```
+
+```{r}
+cancer_cell_param = MASS::fitdistr(cancer_cells$freq, "normal")
+```
+
+```{r mixing_make_proportions, echo=FALSE}
+
+set.seed(999)
+is_melanoma = rep(TRUE, 100)
+
+cell_fractions = lapply(is_melanoma, function(melanoma) {
+  cancer_fraction = rnorm(1, mean=cancer_cell_param$estimate[1], sd=cancer_cell_param$estimate[2])
+  cancer_fraction = ifelse(cancer_fraction < 0, 0, cancer_fraction)
+  cancer_fraction = ifelse(cancer_fraction >= .99, .99, cancer_fraction)
+  names(cancer_fraction) = cell_types$cancer
+
+  
+  # compute random fractions for other cells
+  use_cell_types = c(cell_types$immune_cells, cell_types$other)
+  remaining_fraction = 1 - cancer_fraction
+  rnd = sample(0:100, length(use_cell_types), TRUE)
+  tmp_fractions = (remaining_fraction * rnd) / sum(rnd)
+  names(tmp_fractions) = use_cell_types
+
+  c(cancer_fraction, tmp_fractions)
+}) %>% bind_rows()
+
+# assert almost equal
+assert("all fractions sum up to 1", all(apply(cell_fractions, 1, sum) - rep(1, 100) < 1e-4))
+
+
+```
+
+```{r}
+set.seed(999)
+bulk_mel_1.1_minor = make_bulk_eset(eset=testing_exp,
+                           cell_fractions = cell_fractions,
+                           n=500)
+
+pData(bulk_mel_1.1_minor)=pData(bulk_mel_1.1_minor)%>%
+  mutate(CD4Tconv = Tfh + CD4Tn + Th1)%>%
+  rename(`Mono/Macro` = Monocyte)
+
+fData(bulk_mel_1.1_minor) = rownames_to_column(fData(bulk_mel_1.1_minor),var = "gene_symbol")
+
+saveRDS(bulk_mel_1.1_minor,"loading_data/pseudobulk_data/bulk_melanoma_1.1_minor.rds")
+
+
+
+bulk_mel_1.1_minor_txt = as.data.frame(exprs(bulk_mel_1.1_minor))%>%
+  rownames_to_column("Gene")
+
+
+
+write.table(bulk_mel_1.1_minor_txt, sep = '\t', "loading_data/pseudobulk_data/bulk_mel_1.1_minor.txt", row.names = FALSE, quote = FALSE, col.names = TRUE)
+
+```
+
+
+Making minor single cell reference matrix with TRAINING
+```{r}
+
+a <- t(counts(training_sce))
+
+b <- data.frame(colData(training_sce)[,c("Cell","cell_type")],row.names = NULL)%>%
+  mutate(Cell_type = as.character(cell_type))%>%
+  select(-cell_type)%>%
+  column_to_rownames("Cell")
+
+data <- cbind(a,b)
+
+data2 <- rownames_to_column(data, "Cell")%>%
+  select(-Cell)%>%
+  select(Cell_type, everything())
+
+data2_nocan <- subset(data2, Cell_type !="Malignant")
+  
+
+sigmatrix <- as.data.frame(t(data2_nocan))
+
+finalsigmatrix <- sigmatrix%>%
+  unname()
+
+row.names(finalsigmatrix)[1] <- " "
+
+write.table(finalsigmatrix, sep = '\t', "sigmatrix_mel_1.1_minor.txt", row.names = TRUE, quote = FALSE)
+```
+
+
+

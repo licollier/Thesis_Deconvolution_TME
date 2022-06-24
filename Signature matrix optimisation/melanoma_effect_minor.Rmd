@@ -1,0 +1,119 @@
+
+
+```{r}
+library(rhdf5)
+library(SingleCellExperiment)
+library(Seurat)
+library(data.table)
+
+library(dplyr)
+library(dbplyr)
+library(tidyr)
+library(tibble)
+library(readr)
+library(ggplot2)
+library(magrittr)
+library(readxl)
+library(stringr)
+library(testit)
+library(knitr)
+library(ggpubr)
+library(Matrix.utils)
+library(S4Vectors)
+library(Biobase)
+library(immunedeconv)
+library(data.tree)
+library(rsample)
+devtools::load_all("~/Lieselore/R/Benchmark/immunedeconv")
+```
+
+
+
+```{r}
+bulk_mel_1.1_minor = readRDS("loading_data/pseudobulk_data/bulk_melanoma_1.1_minor.rds")
+
+
+```
+
+
+```{r}
+bulk_mel_1.1_major = bulk_mel_1.1_minor
+pData(bulk_mel_1.1_major) = pData(bulk_mel_1.1_minor)%>%
+  select(-CD4Tn,-Tfh,-Th1)
+
+bulk_mel_1.1_major_txt = as.data.frame(exprs(bulk_mel_1.1_major))%>%
+  rownames_to_column("Gene")
+
+
+
+write.table(bulk_mel_1.1_major_txt, sep = '\t', "loading_data/pseudobulk_data/bulk_mel_1.1_major.txt", row.names = FALSE, quote = FALSE, col.names = TRUE)
+```
+
+```{r}
+true_mel_1.1_minor = pData(bulk_mel_1.1_minor)%>%
+  select(-CD4Tconv)%>%
+  t() %>%
+  as_tibble(rownames="cell_type")%>%
+  gather(sample, true_fraction, -cell_type)
+  
+
+true_mel_1.1_major = pData(bulk_mel_1.1_minor)%>%
+  select(-CD4Tn,-Tfh,-Th1)%>%
+  t() %>%
+  as_tibble(rownames="cell_type")%>%
+  gather(sample, true_fraction, -cell_type)
+
+ggplot(true_mel_1.1_major, aes(x=sample, y=true_fraction)) +
+  geom_bar(aes(fill=cell_type), stat="identity")
+
+```
+
+```{r}
+
+res_mel_1.1_major_minorREF = read.delim("~/Lieselore/R/Signature matrix/epic_results/EPIC_mel_1.1_major_melminorREF_tisch.txt")%>%
+  column_to_rownames("sampleID")%>%
+  t()%>%
+  as.data.frame()%>%
+  rownames_to_column("cell_type")%>%
+  gather(sample,fraction,-cell_type)%>%
+  mutate(method= "Minor signature matrix")
+
+
+res_mel_1.1_major_majorREF = read.delim("~/Lieselore/R/Signature matrix/epic_results/EPIC_mel_1.1_major_melREF_tisch.txt")%>%
+  column_to_rownames("sampleID")%>%
+  t()%>%
+  as.data.frame()%>%
+  rownames_to_column("cell_type")%>%
+  gather(sample,fraction,-cell_type)%>%
+  mutate(method= "Major signature matrix")
+
+
+
+```
+
+```{r}
+both= inner_join(res_mel_1.1_major_minorREF,true_mel_1.1_minor)
+
+both_major =inner_join(res_mel_1.1_major_majorREF, true_mel_1.1_major)
+
+```
+
+```{r}
+all_results = bind_rows(both,both_major)
+
+all_results %>%
+  ggplot(aes(x=true_fraction, y=fraction)) +
+  facet_grid(method ~ cell_type, scales="free") +
+  geom_point() +
+  stat_smooth(aes(color=method), method="lm") +
+  scale_x_continuous(breaks=c(.2, .3)) +
+  stat_cor(aes(label = ..r.label..),size = 3,label.y.npc="top", label.x.npc = "left")+
+  scale_color_discrete(name = "Signature matrix")+
+  xlab("True fraction")+
+  ylab("Fraction")
+
+ggsave("plot_effect_minor.png", width = 16, height = 10)
+
+```
+
+
